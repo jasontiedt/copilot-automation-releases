@@ -101,6 +101,14 @@ jobs:
           existing=$(gh pr list --state open --search "avm key-vault $NEW in:title" --json number --jq 'length')
           echo "count=$existing" >> "$GITHUB_OUTPUT"
 
+      - name: Ensure issue labels exist
+        if: steps.existing.outputs.count == '0'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh label create "avm-update" --color "0E8A16" --description "Automated AVM module bump" --force >/dev/null || true
+          gh label create "automation" --color "5319E7" --description "Opened by an automated workflow"   --force >/dev/null || true
+
       - name: Create issue and assign Copilot
         id: issue
         if: steps.existing.outputs.count == '0'
