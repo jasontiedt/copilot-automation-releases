@@ -46,10 +46,13 @@ For each AVM bump issue:
    `modules/keyvault.bicep`.
 4. Reconcile the `params: { ... }` block of the AVM module call against the
    diff (handle renames, removals, type changes).
-5. Update `parameters/keyvault.example.bicepparam` **only** if it references a
+5. Remove any wrapper parameters marked `// DEPRECATED:` whose stated removal
+   condition is met by the new AVM version (and delete the corresponding
+   coalescing `var` if one exists). Document the removal in `CHANGELOG.md`.
+6. Update `parameters/keyvault.example.bicepparam` **only** if it references a
    parameter that was renamed/removed.
-6. Regenerate the parameter and output tables in `README.md`.
-7. Add a `CHANGELOG.md` entry under a new `## <new-version>` heading
+7. Regenerate the parameter and output tables in `README.md`.
+8. Add a `CHANGELOG.md` entry under a new `## <new-version>` heading
    summarising the change (added / removed / changed parameters and outputs).
 
 ## What NOT to change
