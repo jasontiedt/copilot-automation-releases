@@ -26,7 +26,7 @@ WORK="$(mktemp -d)"
 trap 'rm -rf "$WORK"' EXIT
 
 build_one() {
-  local version="$1" target="$2"
+  local version="$1"
   cat > "$WORK/probe-${version}.bicep" <<EOF
 module m '${MODULE}:${version}' = {
   name: 'probe'
