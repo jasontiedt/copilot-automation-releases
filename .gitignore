@@ -1,0 +1,5 @@
+.artifacts/
+*.bicep.json
+*.log
+.DS_Store
+.vscode/

@@ -1,0 +1,99 @@
+name: consumer-module-update-check
+
+# Reusable fallback for consumer repos that don't run Renovate. Polls the
+# producer's ACR for new `keyvault-shared` tags and opens a PR bumping the
+# pinned version in the consumer's Bicep template.
+#
+# Consumer usage (.github/workflows/module-update-check.yml):
+#
+#   on:
+#     schedule: [{ cron: '0 7 * * *' }]
+#     workflow_dispatch:
+#   jobs:
+#     bump:
+#       uses: <org>/agentic-automation-producer/.github/workflows/consumer-module-update-check.yml@v1
+#       secrets: inherit
+
+on:
+  workflow_call:
+    inputs:
+      template-file:
+        description: 'Path to the consumer Bicep template that pins the module'
+        type: string
+        required: false
+        default: 'main.bicep'
+      module-repo:
+        description: 'OCI repo name of the shared module within the ACR'
+        type: string
+        required: false
+        default: 'keyvault-shared'
+    secrets:
+      AZURE_CLIENT_ID:
+        required: true
+      AZURE_TENANT_ID:
+        required: true
+      AZURE_SUBSCRIPTION_ID:
+        required: true
+
+permissions:
+  id-token: write
+  contents: write
+  pull-requests: write
+
+jobs:
+  bump:
+    runs-on: ubuntu-latest
+    env:
+      ACR_NAME:    ${{ vars.ACR_NAME }}
+      MODULE_REPO: ${{ inputs.module-repo }}
+      TEMPLATE:    ${{ inputs.template-file }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Azure login (OIDC)
+        uses: azure/login@v2
+        with:
+          client-id:       ${{ secrets.AZURE_CLIENT_ID }}
+          tenant-id:       ${{ secrets.AZURE_TENANT_ID }}
+          subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+
+      - name: Read currently pinned version
+        id: pinned
+        run: |
+          current=$(grep -oE "${MODULE_REPO}:[0-9]+\.[0-9]+\.[0-9]+" "$TEMPLATE" | head -n1 | cut -d: -f2)
+          echo "current=$current" >> "$GITHUB_OUTPUT"
+          echo "Currently pinned: $current"
+
+      - name: Discover latest tag in ACR
+        id: latest
+        run: |
+          latest=$(az acr repository show-tags \
+            --name "$ACR_NAME" \
+            --repository "$MODULE_REPO" \
+            --orderby time_desc \
+            --output tsv \
+            | grep -E '^[0-9]+\.[0-9]+\.[0-9]+$' \
+            | sort -V \
+            | tail -n1)
+          echo "latest=$latest" >> "$GITHUB_OUTPUT"
+          echo "Latest in ACR: $latest"
+
+      - name: Open PR if newer
+        if: steps.latest.outputs.latest != '' && steps.latest.outputs.latest != steps.pinned.outputs.current
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          OLD: ${{ steps.pinned.outputs.current }}
+          NEW: ${{ steps.latest.outputs.latest }}
+        run: |
+          BRANCH="bot/${MODULE_REPO}-${NEW}"
+          git config user.name  "module-update-bot"
+          git config user.email "module-update-bot@users.noreply.github.com"
+          git checkout -b "$BRANCH"
+          sed -i "s|${MODULE_REPO}:${OLD}|${MODULE_REPO}:${NEW}|g" "$TEMPLATE"
+          git add "$TEMPLATE"
+          git commit -m "chore: bump ${MODULE_REPO} ${OLD} -> ${NEW}"
+          git push -u origin "$BRANCH"
+          gh pr create \
+            --title "chore: bump ${MODULE_REPO} ${OLD} -> ${NEW}" \
+            --body  "Automated bump of \`${MODULE_REPO}\` from \`${OLD}\` to \`${NEW}\`. CI will run what-if before merge." \
+            --label "module-update,automation"

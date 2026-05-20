@@ -1,0 +1,129 @@
+name: pr-validate
+
+# Validates wrapper-module changes on every PR by running build, lint, and a
+# sandbox what-if via tests/deploy.validation.sh. The same script the
+# avm-update-automation flow expects reviewers to run is now wired to CI so
+# Copilot's bump PRs (and any human PR) get gated automatically.
+
+on:
+  pull_request:
+    paths:
+      - 'avm.version'
+      - 'modules/**'
+      - 'parameters/**'
+      - 'tests/deploy.validation.sh'
+      - 'scripts/**'
+      - '.github/workflows/pr-validate.yml'
+  workflow_dispatch:
+    inputs:
+      deploy:
+        description: 'Run a real deployment after what-if (true/false)'
+        required: false
+        default: 'false'
+
+permissions:
+  id-token: write   # OIDC
+  contents: read
+  pull-requests: write
+
+concurrency:
+  group: pr-validate-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  AZURE_CLIENT_ID:        ${{ secrets.AZURE_CLIENT_ID }}
+  AZURE_TENANT_ID:        ${{ secrets.AZURE_TENANT_ID }}
+  AZURE_SUBSCRIPTION_ID:  ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+  SANDBOX_RESOURCE_GROUP: ${{ vars.SANDBOX_RESOURCE_GROUP }}
+  SANDBOX_LOCATION:       ${{ vars.SANDBOX_LOCATION }}
+
+jobs:
+  validate:
+    name: Build, lint, what-if
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Azure login (OIDC)
+        uses: azure/login@v2
+        with:
+          client-id:       ${{ env.AZURE_CLIENT_ID }}
+          tenant-id:       ${{ env.AZURE_TENANT_ID }}
+          subscription-id: ${{ env.AZURE_SUBSCRIPTION_ID }}
+
+      - name: Install Bicep CLI
+        run: az bicep install
+
+      - name: Run validation script
+        env:
+          DEPLOY: ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.deploy || 'false' }}
+        run: |
+          chmod +x ./tests/deploy.validation.sh
+          ./tests/deploy.validation.sh | tee validation.log
+
+      - name: Upload validation log
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: validation-log
+          path: validation.log
+
+      - name: Comment on PR with result
+        if: github.event_name == 'pull_request'
+        uses: actions/github-script@v7
+        env:
+          STATUS: ${{ job.status }}
+        with:
+          script: |
+            const status = process.env.STATUS;
+            const emoji = status === 'success' ? '✅' : '❌';
+            const body = [
+              `${emoji} **pr-validate**: \`${status}\``,
+              ``,
+              `- \`bicep build\` + \`bicep lint\` + sandbox \`what-if\` ran against \`${process.env.SANDBOX_RESOURCE_GROUP || '(unset)'}\`.`,
+              `- Full log uploaded as the \`validation-log\` artifact on this run.`,
+            ].join('\n');
+            await github.rest.issues.createComment({
+              owner: context.repo.owner,
+              repo:  context.repo.repo,
+              issue_number: context.issue.number,
+              body,
+            });
+
+      - name: Notify Teams
+        if: always() && github.event_name == 'pull_request' && env.TEAMS_WEBHOOK_URL != ''
+        env:
+          TEAMS_WEBHOOK_URL: ${{ secrets.TEAMS_WEBHOOK_URL }}
+          STATUS: ${{ job.status }}
+          PR_URL:   ${{ github.event.pull_request.html_url }}
+          PR_TITLE: ${{ github.event.pull_request.title }}
+          PR_USER:  ${{ github.event.pull_request.user.login }}
+          RUN_URL:  ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          ICON="✅"
+          [[ "$STATUS" != "success" ]] && ICON="❌"
+          jq -n \
+            --arg title "$ICON pr-validate: $STATUS" \
+            --arg text  "**$PR_TITLE** by @$PR_USER" \
+            --arg pr    "$PR_URL" \
+            --arg run   "$RUN_URL" '
+            {
+              type: "message",
+              attachments: [{
+                contentType: "application/vnd.microsoft.card.adaptive",
+                content: {
+                  "$schema": "http://adaptivecards.io/schemas/adaptive-card.json",
+                  type: "AdaptiveCard",
+                  version: "1.4",
+                  body: [
+                    { type: "TextBlock", size: "Medium", weight: "Bolder", text: $title },
+                    { type: "TextBlock", text: $text, wrap: true }
+                  ],
+                  actions: [
+                    { type: "Action.OpenUrl", title: "Open PR",  url: $pr },
+                    { type: "Action.OpenUrl", title: "Run logs", url: $run }
+                  ]
+                }
+              }]
+            }' \
+            | curl -sS -X POST -H 'Content-Type: application/json' -d @- "$TEAMS_WEBHOOK_URL"

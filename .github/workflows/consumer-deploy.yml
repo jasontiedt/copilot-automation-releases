@@ -1,0 +1,161 @@
+name: consumer-deploy
+
+# Reusable deploy workflow for ANY repo that consumes the org-standard
+# `keyvault-shared` Bicep module. Consumer repos call this via:
+#
+#   jobs:
+#     deploy:
+#       uses: <org>/agentic-automation-producer/.github/workflows/consumer-deploy.yml@v1
+#       secrets: inherit
+#
+# Inputs let app teams override paths/environments without forking the
+# workflow. Defaults match the template-repo layout.
+
+on:
+  workflow_call:
+    inputs:
+      template-file:
+        description: 'Path to the consumer Bicep template'
+        type: string
+        required: false
+        default: 'main.bicep'
+      parameters-file:
+        description: 'Path to the .bicepparam file for this run'
+        type: string
+        required: false
+        default: 'parameters/main.bicepparam'
+      deploy-on-push:
+        description: 'Whether to deploy on push to the default branch'
+        type: boolean
+        required: false
+        default: true
+      environment:
+        description: 'GitHub environment to gate the deploy on (optional)'
+        type: string
+        required: false
+        default: ''
+    secrets:
+      AZURE_CLIENT_ID:
+        required: true
+      AZURE_TENANT_ID:
+        required: true
+      AZURE_SUBSCRIPTION_ID:
+        required: true
+      TEAMS_WEBHOOK_URL:
+        required: false
+
+permissions:
+  id-token: write
+  contents: read
+  pull-requests: write
+
+concurrency:
+  group: consumer-deploy-${{ github.repository }}-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  validate:
+    name: Build & what-if
+    runs-on: ubuntu-latest
+    env:
+      RESOURCE_GROUP: ${{ vars.RESOURCE_GROUP }}
+      LOCATION:       ${{ vars.LOCATION }}
+      ACR_NAME:       ${{ vars.ACR_NAME }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Azure login (OIDC)
+        uses: azure/login@v2
+        with:
+          client-id:       ${{ secrets.AZURE_CLIENT_ID }}
+          tenant-id:       ${{ secrets.AZURE_TENANT_ID }}
+          subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+
+      - name: Install Bicep CLI
+        run: az bicep install
+
+      - name: ACR login (pull shared module)
+        run: az acr login --name "$ACR_NAME"
+
+      - name: Build
+        run: az bicep build --file "${{ inputs.template-file }}"
+
+      - name: What-if
+        run: |
+          az deployment group what-if \
+            --resource-group "$RESOURCE_GROUP" \
+            --template-file "${{ inputs.template-file }}" \
+            --parameters    "${{ inputs.parameters-file }}"
+
+  deploy:
+    name: Deploy
+    needs: validate
+    if: ${{ inputs.deploy-on-push && github.event_name == 'push' && github.ref == format('refs/heads/{0}', github.event.repository.default_branch) }}
+    runs-on: ubuntu-latest
+    environment: ${{ inputs.environment }}
+    env:
+      RESOURCE_GROUP: ${{ vars.RESOURCE_GROUP }}
+      LOCATION:       ${{ vars.LOCATION }}
+      ACR_NAME:       ${{ vars.ACR_NAME }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Azure login (OIDC)
+        uses: azure/login@v2
+        with:
+          client-id:       ${{ secrets.AZURE_CLIENT_ID }}
+          tenant-id:       ${{ secrets.AZURE_TENANT_ID }}
+          subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+
+      - name: Install Bicep CLI
+        run: az bicep install
+
+      - name: ACR login
+        run: az acr login --name "$ACR_NAME"
+
+      - name: Deploy
+        id: dep
+        run: |
+          NAME="consumer-${{ github.run_id }}"
+          az deployment group create \
+            --name "$NAME" \
+            --resource-group "$RESOURCE_GROUP" \
+            --template-file "${{ inputs.template-file }}" \
+            --parameters    "${{ inputs.parameters-file }}"
+          echo "name=$NAME" >> "$GITHUB_OUTPUT"
+
+      - name: Notify Teams
+        if: always() && env.TEAMS_WEBHOOK_URL != ''
+        env:
+          TEAMS_WEBHOOK_URL: ${{ secrets.TEAMS_WEBHOOK_URL }}
+          STATUS:    ${{ job.status }}
+          REPO:      ${{ github.repository }}
+          COMMIT:    ${{ github.sha }}
+          DEP_NAME:  ${{ steps.dep.outputs.name }}
+          RUN_URL:   ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          ICON="✅"
+          [[ "$STATUS" != "success" ]] && ICON="❌"
+          jq -n \
+            --arg title "$ICON $REPO deploy: $STATUS" \
+            --arg text  "Deployment **$DEP_NAME** to RG \`$RESOURCE_GROUP\` (region \`$LOCATION\`)." \
+            --arg run   "$RUN_URL" '
+            {
+              type: "message",
+              attachments: [{
+                contentType: "application/vnd.microsoft.card.adaptive",
+                content: {
+                  "$schema": "http://adaptivecards.io/schemas/adaptive-card.json",
+                  type: "AdaptiveCard",
+                  version: "1.4",
+                  body: [
+                    { type: "TextBlock", size: "Medium", weight: "Bolder", text: $title },
+                    { type: "TextBlock", text: $text, wrap: true }
+                  ],
+                  actions: [
+                    { type: "Action.OpenUrl", title: "Run logs", url: $run }
+                  ]
+                }
+              }]
+            }' \
+            | curl -sS -X POST -H 'Content-Type: application/json' -d @- "$TEAMS_WEBHOOK_URL"

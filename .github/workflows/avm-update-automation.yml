@@ -1,0 +1,177 @@
+name: avm-update-automation
+
+on:
+  schedule:
+    # Daily at 06:00 UTC
+    - cron: '0 6 * * *'
+  workflow_dispatch:
+    inputs:
+      force_version:
+        description: 'Force a specific AVM version (overrides registry check)'
+        required: false
+        default: ''
+
+permissions:
+  contents: write
+  issues: write
+  pull-requests: write
+
+concurrency:
+  group: avm-update
+  cancel-in-progress: false
+
+env:
+  AVM_MODULE_PATH: bicep/avm/res/key-vault/vault
+
+jobs:
+  detect:
+    name: Detect new AVM version
+    runs-on: ubuntu-latest
+    outputs:
+      current: ${{ steps.check.outputs.current }}
+      latest:  ${{ steps.check.outputs.latest }}
+      has_update: ${{ steps.check.outputs.has_update }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Check latest AVM Key Vault version
+        id: check
+        env:
+          MODULE_PATH: ${{ env.AVM_MODULE_PATH }}
+        run: |
+          chmod +x ./scripts/check-avm-version.sh
+          ./scripts/check-avm-version.sh
+
+      - name: Apply forced version override
+        if: ${{ github.event.inputs.force_version != '' }}
+        run: |
+          echo "latest=${{ github.event.inputs.force_version }}" >> "$GITHUB_OUTPUT"
+          echo "has_update=true" >> "$GITHUB_OUTPUT"
+        id: override
+
+  diff:
+    name: Diff old vs. new
+    needs: detect
+    if: needs.detect.outputs.has_update == 'true'
+    runs-on: ubuntu-latest
+    outputs:
+      summary_path: ${{ steps.diff.outputs.summary_path }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Bicep CLI
+        run: az bicep install
+
+      - name: Generate diff
+        id: diff
+        run: |
+          chmod +x ./scripts/diff-avm-versions.sh
+          ./scripts/diff-avm-versions.sh \
+            "${{ needs.detect.outputs.current }}" \
+            "${{ needs.detect.outputs.latest }}" \
+            "./.artifacts/avm-diff"
+          echo "summary_path=./.artifacts/avm-diff/summary.md" >> "$GITHUB_OUTPUT"
+
+      - name: Upload diff artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: avm-diff
+          path: ./.artifacts/avm-diff
+
+  dispatch-copilot:
+    name: Open Copilot update issue
+    needs: [detect, diff]
+    if: needs.detect.outputs.has_update == 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Download diff artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: avm-diff
+          path: ./.artifacts/avm-diff
+
+      - name: Skip if PR already exists
+        id: existing
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          NEW: ${{ needs.detect.outputs.latest }}
+        run: |
+          existing=$(gh pr list --state open --search "avm key-vault $NEW in:title" --json number --jq 'length')
+          echo "count=$existing" >> "$GITHUB_OUTPUT"
+
+      - name: Create issue and assign Copilot
+        id: issue
+        if: steps.existing.outputs.count == '0'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          OLD: ${{ needs.detect.outputs.current }}
+          NEW: ${{ needs.detect.outputs.latest }}
+        run: |
+          DIFF_BODY="$(cat ./.artifacts/avm-diff/summary.md)"
+          BODY=$(cat <<EOF
+          ## Task
+
+          Bump the AVM Key Vault module from \`$OLD\` to \`$NEW\`.
+
+          ### Files to update
+          - \`avm.version\` — set to \`$NEW\`
+          - \`modules/keyvault.bicep\` — update the \`br/public:avm/res/key-vault/vault:<version>\` reference and reconcile parameter mappings against the diff below
+          - \`parameters/keyvault.example.bicepparam\` — only if the example uses a parameter that was renamed/removed
+          - \`README.md\` — regenerate the parameters/outputs table
+
+          ### Constraints (do NOT violate)
+          See \`.github/copilot-instructions.md\`. Highlights:
+          - **Never** weaken security defaults (\`enablePurgeProtection\`, \`enableRbacAuthorization\`, \`publicNetworkAccess: Disabled\`, \`networkAcls.defaultAction: Deny\`, \`softDeleteRetentionInDays: 90\`).
+          - **Never** silently remove a wrapper parameter — deprecate with a comment first.
+          - Maintain backward compatibility for consumers of the wrapper.
+          - All edits must compile (\`az bicep build\`) and lint cleanly.
+
+          ### Diff summary
+
+          $DIFF_BODY
+
+          ---
+          _Opened automatically by \`avm-update-automation\` workflow._
+          EOF
+          )
+
+          URL=$(gh issue create \
+            --title "chore(avm): bump key-vault to $NEW" \
+            --body "$BODY" \
+            --label "avm-update,automation" \
+            --assignee "copilot")
+          echo "url=$URL" >> "$GITHUB_OUTPUT"
+
+      - name: Notify Teams
+        if: steps.existing.outputs.count == '0' && env.TEAMS_WEBHOOK_URL != ''
+        env:
+          TEAMS_WEBHOOK_URL: ${{ secrets.TEAMS_WEBHOOK_URL }}
+          OLD: ${{ needs.detect.outputs.current }}
+          NEW: ${{ needs.detect.outputs.latest }}
+          ISSUE_URL: ${{ steps.issue.outputs.url }}
+        run: |
+          jq -n \
+            --arg title "AVM Key Vault: new version detected" \
+            --arg text  "**$OLD → $NEW** — Copilot issue opened." \
+            --arg url   "$ISSUE_URL" '
+            {
+              type: "message",
+              attachments: [{
+                contentType: "application/vnd.microsoft.card.adaptive",
+                content: {
+                  "$schema": "http://adaptivecards.io/schemas/adaptive-card.json",
+                  type: "AdaptiveCard",
+                  version: "1.4",
+                  body: [
+                    { type: "TextBlock", size: "Medium", weight: "Bolder", text: $title },
+                    { type: "TextBlock", text: $text, wrap: true }
+                  ],
+                  actions: [
+                    { type: "Action.OpenUrl", title: "Open Copilot issue", url: $url }
+                  ]
+                }
+              }]
+            }' \
+            | curl -sS -X POST -H 'Content-Type: application/json' -d @- "$TEAMS_WEBHOOK_URL"

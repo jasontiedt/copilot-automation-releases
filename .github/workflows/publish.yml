@@ -1,0 +1,138 @@
+name: publish-shared-module
+
+# Publishes modules/keyvault.bicep to the private ACR as an OCI Bicep module.
+# Triggered when:
+#   - a tag matching v*.*.* is pushed (preferred — semver release)
+#   - manually via workflow_dispatch (force a publish)
+#
+# Auth: GitHub OIDC -> Azure federated credential on a UAMI/SP with AcrPush
+#       on the target registry.
+
+on:
+  push:
+    tags:
+      - 'v*.*.*'
+  workflow_dispatch:
+    inputs:
+      version:
+        description: 'Module version to publish (semver, no leading v)'
+        required: true
+
+permissions:
+  id-token: write   # OIDC
+  contents: read
+
+concurrency:
+  group: publish-shared-module
+  cancel-in-progress: false
+
+env:
+  ACR_NAME:        ${{ vars.ACR_NAME }}            # e.g. adusasharedmodules
+  MODULE_REPO:     keyvault-shared                  # OCI repo name within the ACR
+  MODULE_PATH:     modules/keyvault.bicep
+  AZURE_CLIENT_ID:       ${{ secrets.AZURE_CLIENT_ID }}
+  AZURE_TENANT_ID:       ${{ secrets.AZURE_TENANT_ID }}
+  AZURE_SUBSCRIPTION_ID: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+
+jobs:
+  publish:
+    name: Publish to ACR
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Resolve version
+        id: ver
+        run: |
+          if [[ "${{ github.event_name }}" == "workflow_dispatch" ]]; then
+            VERSION="${{ github.event.inputs.version }}"
+          else
+            VERSION="${GITHUB_REF_NAME#v}"
+          fi
+          if [[ ! "$VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo "::error::Invalid semver: $VERSION"
+            exit 1
+          fi
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+          echo "Publishing version $VERSION"
+
+      - name: Cross-check avm.version is committed
+        run: |
+          test -f avm.version
+          echo "Pinned AVM version: $(cat avm.version)"
+
+      - name: Azure login (OIDC)
+        uses: azure/login@v2
+        with:
+          client-id:       ${{ env.AZURE_CLIENT_ID }}
+          tenant-id:       ${{ env.AZURE_TENANT_ID }}
+          subscription-id: ${{ env.AZURE_SUBSCRIPTION_ID }}
+
+      - name: Install Bicep CLI
+        run: az bicep install
+
+      - name: Build (sanity)
+        run: az bicep build --file "$MODULE_PATH"
+
+      - name: Publish module to ACR
+        env:
+          VERSION: ${{ steps.ver.outputs.version }}
+        run: |
+          TARGET="br:${ACR_NAME}.azurecr.io/${MODULE_REPO}:${VERSION}"
+          echo "Publishing to ${TARGET}"
+          az bicep publish \
+            --file "$MODULE_PATH" \
+            --target "$TARGET" \
+            --documentation-uri "https://github.com/${{ github.repository }}/blob/${{ github.sha }}/README.md" \
+            --with-source
+
+      - name: Summary
+        env:
+          VERSION: ${{ steps.ver.outputs.version }}
+        run: |
+          {
+            echo "## Published \`keyvault-shared:${VERSION}\`"
+            echo ""
+            echo "- Registry: \`${ACR_NAME}.azurecr.io\`"
+            echo "- Module: \`br:${ACR_NAME}.azurecr.io/${MODULE_REPO}:${VERSION}\`"
+            echo "- Pinned AVM version: \`$(cat avm.version)\`"
+            echo "- Commit: \`${{ github.sha }}\`"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Notify Teams
+        if: env.TEAMS_WEBHOOK_URL != ''
+        env:
+          TEAMS_WEBHOOK_URL: ${{ secrets.TEAMS_WEBHOOK_URL }}
+          VERSION:    ${{ steps.ver.outputs.version }}
+          REPO_URL:   ${{ github.server_url }}/${{ github.repository }}
+          COMMIT_SHA: ${{ github.sha }}
+        run: |
+          AVM_VER="$(cat avm.version)"
+          MODULE_URI="br:${ACR_NAME}.azurecr.io/${MODULE_REPO}:${VERSION}"
+          jq -n \
+            --arg title "📦 keyvault-shared $VERSION published" \
+            --arg text  "Published to **$ACR_NAME.azurecr.io** (pinned AVM \`$AVM_VER\`)." \
+            --arg uri   "$MODULE_URI" \
+            --arg url   "$REPO_URL/releases/tag/v$VERSION" \
+            --arg sha   "$REPO_URL/commit/$COMMIT_SHA" '
+            {
+              type: "message",
+              attachments: [{
+                contentType: "application/vnd.microsoft.card.adaptive",
+                content: {
+                  "$schema": "http://adaptivecards.io/schemas/adaptive-card.json",
+                  type: "AdaptiveCard",
+                  version: "1.4",
+                  body: [
+                    { type: "TextBlock", size: "Medium", weight: "Bolder", text: $title },
+                    { type: "TextBlock", text: $text, wrap: true },
+                    { type: "TextBlock", text: $uri, wrap: true, isSubtle: true, fontType: "Monospace" }
+                  ],
+                  actions: [
+                    { type: "Action.OpenUrl", title: "Release", url: $url },
+                    { type: "Action.OpenUrl", title: "Commit",  url: $sha }
+                  ]
+                }
+              }]
+            }' \
+            | curl -sS -X POST -H 'Content-Type: application/json' -d @- "$TEAMS_WEBHOOK_URL"
