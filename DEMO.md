@@ -25,6 +25,13 @@ that order. Times assume one presenter, one screen.
 > (`vaultSku`, `enableSoftDelete`, `accessPolicies`). This guarantees the
 > manual workflow run produces a real reconciliation task — see Step 5b.
 
+> **Required repo secret:** `COPILOT_ASSIGN_TOKEN` — a fine-grained PAT
+> with `Issues: read & write` on this repo. Assigning the Copilot coding
+> agent goes through the GraphQL `replaceActorsForAssignable` mutation,
+> which rejects the default `GITHUB_TOKEN` (it's an installation token).
+> Without this secret the workflow falls back to `GITHUB_TOKEN` and the
+> assignment step will fail.
+
 ---
 
 ## Step 1 — Frame the problem (1 min)

@@ -113,7 +113,11 @@ jobs:
         id: issue
         if: steps.existing.outputs.count == '0'
         env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          # Assigning the Copilot coding agent requires a user token; the
+          # default GITHUB_TOKEN is an installation token and is rejected by
+          # GraphQL replaceActorsForAssignable. Provide a fine-grained PAT
+          # (Issues: read+write) as repo secret COPILOT_ASSIGN_TOKEN.
+          GH_TOKEN: ${{ secrets.COPILOT_ASSIGN_TOKEN || secrets.GITHUB_TOKEN }}
           OLD: ${{ needs.detect.outputs.current }}
           NEW: ${{ needs.detect.outputs.latest }}
         run: |
