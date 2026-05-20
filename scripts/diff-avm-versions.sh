@@ -77,7 +77,10 @@ diff_section outputs    > "$OUT/outputs.diff.json"
   echo "# AVM Key Vault: \`$OLD\` → \`$NEW\`"
   echo
   for section in parameters outputs; do
-    file="$OUT/${section}.diff.json"
+    case "$section" in
+      parameters) file="$OUT/params.diff.json" ;;
+      outputs)    file="$OUT/outputs.diff.json" ;;
+    esac
     echo "## ${section^}"
     added="$(jq -r '.added | length' "$file")"
     removed="$(jq -r '.removed | length' "$file")"
