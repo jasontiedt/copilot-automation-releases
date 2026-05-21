@@ -235,4 +235,6 @@ Examples:
   the new object type and remove the `vaultSku` alias permanently.
 -->
 
-(none yet)
+Do not remove parameters, cannot be changed: 
+  vaultSku 
+  
