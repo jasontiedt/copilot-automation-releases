@@ -34,25 +34,8 @@ param location string
 @allowed([ 'standard', 'premium' ])
 param skuName string = 'standard'
 
-// DEPRECATED: legacy alias kept from the pre-AVM module surface. Newer AVM
-// versions only accept `sku`/`skuName`. Coalesced below; remove on next bump.
-@description('Deprecated. Legacy alias for skuName. Do not use in new templates.')
-@allowed([ '', 'standard', 'premium' ])
-param vaultSku string = ''
-
 @description('Optional. Enable RBAC authorization (org standard). Access policies are disallowed.')
 param enableRbacAuthorization bool = true
-
-// DEPRECATED: AVM 0.9+ enforces soft-delete unconditionally; this knob is a
-// no-op and should be removed when bumping to a current AVM version.
-@description('Deprecated. Soft delete is always-on in current AVM. Retained for backward compatibility.')
-param enableSoftDelete bool = true
-
-// DEPRECATED: org policy mandates RBAC-only auth. accessPolicies must stay
-// empty. Retained as a wrapper parameter only to surface a clear error when
-// callers attempt to set it; should be dropped on the next AVM bump.
-@description('Deprecated. Access policies are disallowed by org policy. Must remain empty.')
-param accessPolicies array = []
 
 @description('Optional. Soft-delete retention in days. Org minimum is 90.')
 @minValue(90)
@@ -108,20 +91,16 @@ var defaultDiagnostics = empty(logAnalyticsWorkspaceResourceId) ? [] : [
 
 var effectiveDiagnostics = empty(diagnosticSettings) ? defaultDiagnostics : diagnosticSettings
 
-// Coalesce deprecated `vaultSku` into `skuName`. Once `vaultSku` is removed
-// (next AVM bump), this var collapses back to `skuName`.
-var effectiveSku = empty(vaultSku) ? skuName : vaultSku
-
 // ---------------------------------------------------------------------------
 // AVM module call
 // ---------------------------------------------------------------------------
 
-module vault 'br/public:avm/res/key-vault/vault:0.10.0' = {
+module vault 'br/public:avm/res/key-vault/vault:0.13.3' = {
   name: 'kv-${uniqueString(resourceGroup().id, name)}'
   params: {
     name: name
     location: location
-    sku: any(effectiveSku)
+    sku: any(skuName)
     enableRbacAuthorization: enableRbacAuthorization
     softDeleteRetentionInDays: softDeleteRetentionInDays
     enablePurgeProtection: enablePurgeProtection
